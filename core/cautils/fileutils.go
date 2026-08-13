@@ -22,6 +22,9 @@ import (
 	"github.com/kubescape/opa-utils/objectsenvelopes/localworkload"
 	"gopkg.in/yaml.v3"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/kubernetes/scheme"
 )
 
 var (
@@ -35,6 +38,46 @@ const (
 	YAML_FILE_FORMAT FileFormat = "yaml"
 	JSON_FILE_FORMAT FileFormat = "json"
 )
+
+// knownKubernetesAPIGroups lists the API groups of the built-in Kubernetes
+// types registered in the client-go scheme. Kubernetes forbids custom
+// resources from using these groups, so an unknown kind under a known group
+// is reliably a typo (or an attempt to use a removed resource) rather than a
+// valid CRD. The empty string key represents the core group ("v1").
+var knownKubernetesAPIGroups = map[string]struct{}{
+	"":                             {},
+	"admissionregistration.k8s.io": {},
+	"apiextensions.k8s.io":         {},
+	"apps":                         {},
+	"authentication.k8s.io":        {},
+	"authorization.k8s.io":         {},
+	"autoscaling":                  {},
+	"batch":                        {},
+	"certificates.k8s.io":          {},
+	"coordination.k8s.io":          {},
+	"discovery.k8s.io":             {},
+	"events.k8s.io":                {},
+	"extensions":                   {},
+	"flowcontrol.apiserver.k8s.io": {},
+	"networking.k8s.io":            {},
+	"node.k8s.io":                  {},
+	"policy":                       {},
+	"rbac.authorization.k8s.io":    {},
+	"scheduling.k8s.io":            {},
+	"storage.k8s.io":               {},
+}
+
+// knownKubernetesGroup reports whether apiVersion belongs to a built-in
+// Kubernetes API group. An apiVersion without a group prefix (e.g. "v1") is
+// the core group.
+func knownKubernetesGroup(apiVersion string) bool {
+	group, _, hasSlash := strings.Cut(apiVersion, "/")
+	if !hasSlash {
+		return true // core group
+	}
+	_, ok := knownKubernetesAPIGroups[group]
+	return ok
+}
 
 type Chart struct {
 	Name string
@@ -705,6 +748,7 @@ func readYamlFile(yamlFile []byte) (yamlObjs []workloadinterface.IMetadata, err 
 	}()
 
 	var parseErrs []error
+	decoder := scheme.Codecs.UniversalDeserializer()
 	for i, doc := range splitYAMLDocuments(yamlFile) {
 		var t any
 		if unmarshalErr := yaml.Unmarshal(doc, &t); unmarshalErr != nil {
@@ -716,6 +760,31 @@ func readYamlFile(yamlFile []byte) (yamlObjs []workloadinterface.IMetadata, err 
 			continue
 		}
 		if obj, ok := j.(map[string]any); ok {
+			// Validate against the registered Kubernetes scheme. Only
+			// documents that look like an attempted manifest (have both
+			// apiVersion and kind) are checked, so non-manifest YAML such
+			// as Chart.yaml, values.yaml and CI configs stays silently
+			// ignored.
+			if _, hasAPIVersion := obj["apiVersion"]; hasAPIVersion {
+				if _, hasKind := obj["kind"]; hasKind {
+					_, _, decodeErr := decoder.Decode(doc, nil, nil)
+					if decodeErr != nil {
+						if !runtime.IsNotRegisteredError(decodeErr) {
+							parseErrs = append(parseErrs, fmt.Errorf("document %d: %w", i+1, decodeErr))
+						} else if apiVer, ok := obj["apiVersion"].(string); ok && knownKubernetesGroup(apiVer) {
+							// Only a kind typo under a version the scheme
+							// actually registers is flagged: an unknown kind
+							// under a current version is a typo, but an
+							// unknown version (e.g. a future API) is not and
+							// must stay scannable.
+							if gv, gvErr := schema.ParseGroupVersion(apiVer); gvErr == nil && scheme.Scheme.IsVersionRegistered(gv) {
+								parseErrs = append(parseErrs,
+									fmt.Errorf("document %d: not a valid Kubernetes kind", i+1))
+							}
+						}
+					}
+				}
+			}
 			objects, objectErr := manifestObjectToWorkloads(obj)
 			yamlObjs = append(yamlObjs, objects...)
 			if objectErr != nil {
@@ -825,11 +894,13 @@ func manifestObjectToWorkloads(obj map[string]any) ([]workloadinterface.IMetadat
 	}
 
 	// Only surface as skipped when the document looks like an attempted
-	// Kubernetes manifest (has apiVersion). Files without apiVersion —
-	// Chart.yaml, values.yaml, CI configs, docker-compose.yaml — are
-	// silently ignored as before.
+	// Kubernetes manifest (has both apiVersion and kind). Files without
+	// kind — Chart.yaml, values.yaml, CI configs, docker-compose.yaml —
+	// are silently ignored as before.
 	if _, hasAPIVersion := obj["apiVersion"]; hasAPIVersion {
-		return nil, fmt.Errorf("not a valid Kubernetes object")
+		if _, hasKind := obj["kind"]; hasKind {
+			return nil, fmt.Errorf("not a valid Kubernetes object")
+		}
 	}
 	return nil, nil
 }

@@ -1037,3 +1037,53 @@ items:
 		})
 	}
 }
+
+func TestReadYamlFile_ValidPod_PassesSchemeValidation(t *testing.T) {
+	manifest := []byte("apiVersion: v1\nkind: Pod\nmetadata:\n  name: test\n  namespace: default\n")
+	workloads, err := readYamlFile(manifest)
+	require.NoError(t, err)
+	assert.Len(t, workloads, 1)
+}
+
+func TestReadYamlFile_CRD_PassesValidation(t *testing.T) {
+	manifest := []byte("apiVersion: cert-manager.io/v1\nkind: Certificate\nmetadata:\n  name: test\n  namespace: default\n")
+	workloads, err := readYamlFile(manifest)
+	require.NoError(t, err)
+	assert.Len(t, workloads, 1)
+}
+
+func TestReadYamlFile_BadFieldType_ReturnsError(t *testing.T) {
+	manifest := []byte("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: test\n  namespace: default\nspec:\n  replicas: abc\n")
+	workloads, err := readYamlFile(manifest)
+	assert.Error(t, err)
+	assert.Len(t, workloads, 1, "should still load as unstructured workload")
+}
+
+func TestReadYamlFile_NoApiVersion_SilentlyIgnored(t *testing.T) {
+	manifest := []byte("foo: bar\nbaz: qux\n")
+	workloads, err := readYamlFile(manifest)
+	require.NoError(t, err)
+	assert.Empty(t, workloads)
+}
+
+func TestReadYamlFile_ValidAndBadMultiDoc_SurfacesBadDocument(t *testing.T) {
+	manifest := []byte("apiVersion: v1\nkind: Pod\nmetadata:\n  name: test\n  namespace: default\n---\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: test\n  namespace: default\nspec:\n  replicas: abc\n")
+	workloads, err := readYamlFile(manifest)
+	assert.Error(t, err)
+	assert.Len(t, workloads, 2, "both documents load as unstructured; the bad one additionally surfaces a decode error")
+}
+
+func TestReadYamlFile_TypoedKindInKnownGroup_ReturnsError(t *testing.T) {
+	manifest := []byte("apiVersion: apps/v1\nkind: Deplyment\nmetadata:\n  name: test\n  namespace: default\n")
+	workloads, err := readYamlFile(manifest)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "not a valid Kubernetes kind")
+	assert.Len(t, workloads, 1)
+}
+
+func TestReadYamlFile_TypoedCoreGroupKind_ReturnsError(t *testing.T) {
+	manifest := []byte("apiVersion: v1\nkind: Pods\nmetadata:\n  name: test\n  namespace: default\n")
+	_, err := readYamlFile(manifest)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "not a valid Kubernetes kind")
+}
